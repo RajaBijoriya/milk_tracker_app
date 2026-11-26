@@ -362,3 +362,189 @@ test('serves historical statements and keeps finalized snapshots immutable', asy
     const preservedBill = await models.MonthlyBill.findOne({milkProfileId: profileId, billMonth: today.slice(0, 7)});
     assert.equal(preservedBill?.status, 'finalized');
   });
+
+  test('records partial payments once and carries outstanding balances forward oldest-first', async () => {
+    const {data} = await registerAccount();
+    const range = startDateRangeAt(new Date(), 'Asia/Kolkata');
+    const created = await request(app)
+      .post('/api/v1/milk/profiles')
+      .set(authorized(data.accessToken))
+      .send({name: 'Milk', defaultQuantityMl: 1000, pricePerLitrePaise: 1000, startDate: range.min});
+    assert.equal(created.status, 201);
+
+    const listed = await request(app)
+      .get('/api/v1/milk/bills?page=1&limit=100')
+      .set(authorized(data.accessToken));
+    assert.equal(listed.status, 200);
+    const oldestBill = listed.body.data.bills.at(-1);
+    assert.ok(oldestBill.totalAmountPaise > 0);
+
+    const firstPayment = {
+      amountPaise: 500,
+      paymentDate: dateKeyAt(new Date(), 'Asia/Kolkata'),
+      paymentMethod: 'upi',
+      note: 'Part payment',
+      idempotencyKey: `payment-test-${Date.now()}-one`,
+      month: oldestBill.month,
+    };
+    const [recorded, repeated] = await Promise.all([
+      request(app).post('/api/v1/milk/payments').set(authorized(data.accessToken)).send(firstPayment),
+      request(app).post('/api/v1/milk/payments').set(authorized(data.accessToken)).send(firstPayment),
+    ]);
+    assert.ok([recorded.status, repeated.status].includes(201));
+    assert.ok([recorded.status, repeated.status].includes(200));
+    const accepted = recorded.status === 201 ? recorded : repeated;
+    assert.equal(accepted.status, 201, JSON.stringify(accepted.body));
+    assert.equal(accepted.body.data.payment.amountPaise, 500);
+    assert.deepEqual(accepted.body.data.payment.allocations, [{billMonth: oldestBill.month, amountPaise: 500}]);
+    const replay = recorded.status === 200 ? recorded : repeated;
+    assert.equal(replay.body.data.replayed, true);
+    assert.equal(await models.MilkPayment.countDocuments({userId: data.user.id}), 1);
+
+    const reusedKey = await request(app)
+      .post('/api/v1/milk/payments')
+      .set(authorized(data.accessToken))
+      .send({...firstPayment, amountPaise: 600});
+    assert.equal(reusedKey.status, 409);
+    assert.equal(reusedKey.body.error.code, 'IDEMPOTENCY_KEY_REUSED');
+
+    const detail = await request(app)
+      .get(`/api/v1/milk/bills/${oldestBill.month}`)
+      .set(authorized(data.accessToken));
+    assert.equal(detail.status, 200);
+    assert.equal(detail.body.data.bill.paymentStatus, 'partially_paid');
+    assert.equal(detail.body.data.bill.amountPaidPaise, 500);
+    assert.equal(detail.body.data.bill.paymentHistory.length, 1);
+
+    const secondPartial = await request(app)
+      .post('/api/v1/milk/payments')
+      .set(authorized(data.accessToken))
+      .send({
+        ...firstPayment,
+        amountPaise: 250,
+        idempotencyKey: `payment-test-${Date.now()}-second-partial`,
+      });
+    assert.equal(secondPartial.status, 201, JSON.stringify(secondPartial.body));
+
+    const summary = await request(app)
+      .get('/api/v1/milk/bills/summary')
+      .set(authorized(data.accessToken));
+    assert.equal(summary.status, 200);
+    assert.equal(
+      summary.body.data.summary.totalPayablePaise,
+      summary.body.data.summary.currentMonthRemainingPaise + summary.body.data.summary.previousOutstandingPaise,
+    );
+    assert.ok(summary.body.data.summary.previousOutstandingPaise >= oldestBill.totalAmountPaise - 750);
+
+    const oldestRemaining = oldestBill.totalAmountPaise - 750;
+    const carryPayment = await request(app)
+      .post('/api/v1/milk/payments')
+      .set(authorized(data.accessToken))
+      .send({
+        amountPaise: oldestRemaining,
+        paymentDate: dateKeyAt(new Date(), 'Asia/Kolkata'),
+        paymentMethod: 'cash',
+        note: '',
+        idempotencyKey: `payment-test-${Date.now()}-two`,
+      });
+    assert.equal(carryPayment.status, 201, JSON.stringify(carryPayment.body));
+    assert.equal(carryPayment.body.data.payment.allocations[0].billMonth, oldestBill.month);
+
+    const paidOldest = await request(app)
+      .get(`/api/v1/milk/bills/${oldestBill.month}`)
+      .set(authorized(data.accessToken));
+    assert.equal(paidOldest.body.data.bill.paymentStatus, 'paid');
+    const paymentHistory = await request(app)
+      .get(`/api/v1/milk/payments?month=${oldestBill.month}`)
+      .set(authorized(data.accessToken));
+    assert.equal(paymentHistory.body.data.total, 3);
+
+    const overpayment = await request(app)
+      .post('/api/v1/milk/payments')
+      .set(authorized(data.accessToken))
+      .send({
+        amountPaise: summary.body.data.summary.totalOutstandingPaise + 1,
+        paymentDate: dateKeyAt(new Date(), 'Asia/Kolkata'),
+        paymentMethod: 'other',
+        note: '',
+        idempotencyKey: `payment-test-${Date.now()}-three`,
+      });
+    assert.equal(overpayment.status, 422);
+    assert.equal(overpayment.body.error.code, 'PAYMENT_EXCEEDS_OUTSTANDING');
+  });
+
+  test('does not allow milk edits to reduce a bill below accepted payments', async () => {
+    const {data} = await registerAccount();
+    const today = dateKeyAt(new Date(), 'Asia/Kolkata');
+    const created = await request(app)
+      .post('/api/v1/milk/profiles')
+      .set(authorized(data.accessToken))
+      .send({name: 'Milk', defaultQuantityMl: 1000, pricePerLitrePaise: 7000, startDate: today});
+    assert.equal(created.status, 201);
+
+    const bill = await request(app)
+      .get(`/api/v1/milk/bills/${today.slice(0, 7)}`)
+      .set(authorized(data.accessToken));
+    const payment = await request(app)
+      .post('/api/v1/milk/payments')
+      .set(authorized(data.accessToken))
+      .send({
+        amountPaise: bill.body.data.bill.totalAmountPaise,
+        paymentDate: today,
+        paymentMethod: 'cash',
+        note: '',
+        idempotencyKey: `payment-test-${Date.now()}-full`,
+        month: today.slice(0, 7),
+      });
+    assert.equal(payment.status, 201, JSON.stringify(payment.body));
+
+    const edit = await request(app)
+      .put(`/api/v1/milk/entries/${today}`)
+      .set(authorized(data.accessToken))
+      .send({quantityMl: 0, version: 0});
+    assert.equal(edit.status, 409);
+    assert.equal(edit.body.error.code, 'PAYMENT_ADJUSTMENT_CONFLICT');
+  });
+
+  test('treats a zero-value bill as paid and isolates payment history by account', async () => {
+    const {data: first} = await registerAccount();
+    const today = dateKeyAt(new Date(), 'Asia/Kolkata');
+    const firstProfile = await request(app)
+      .post('/api/v1/milk/profiles')
+      .set(authorized(first.accessToken))
+      .send({name: 'First account', defaultQuantityMl: 1000, pricePerLitrePaise: 7000, startDate: today});
+    assert.equal(firstProfile.status, 201);
+    const firstBill = await request(app)
+      .get(`/api/v1/milk/bills/${today.slice(0, 7)}`)
+      .set(authorized(first.accessToken));
+    const firstPayment = await request(app)
+      .post('/api/v1/milk/payments')
+      .set(authorized(first.accessToken))
+      .send({
+        amountPaise: 1,
+        paymentDate: today,
+        paymentMethod: 'cash',
+        note: '',
+        idempotencyKey: `payment-test-${Date.now()}-owner`,
+        month: today.slice(0, 7),
+      });
+    assert.equal(firstPayment.status, 201, JSON.stringify(firstPayment.body));
+
+    const {data: second} = await registerAccount();
+    const secondProfile = await request(app)
+      .post('/api/v1/milk/profiles')
+      .set(authorized(second.accessToken))
+      .send({name: 'No delivery', defaultQuantityMl: 0, pricePerLitrePaise: 7000, startDate: today});
+    assert.equal(secondProfile.status, 201);
+    const zeroBill = await request(app)
+      .get(`/api/v1/milk/bills/${today.slice(0, 7)}`)
+      .set(authorized(second.accessToken));
+    assert.equal(zeroBill.body.data.bill.totalAmountPaise, 0);
+    assert.equal(zeroBill.body.data.bill.paymentStatus, 'paid');
+    const history = await request(app)
+      .get('/api/v1/milk/payments')
+      .set(authorized(second.accessToken));
+    assert.equal(history.status, 200);
+    assert.equal(history.body.data.total, 0);
+    assert.ok(firstBill.body.data.bill.totalAmountPaise > 0);
+  });

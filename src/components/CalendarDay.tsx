@@ -1,6 +1,7 @@
 import React from 'react';
-import {StyleSheet, Text, TouchableOpacity, View} from 'react-native';
+import {StyleSheet, Text, TouchableOpacity} from 'react-native';
 import {colors} from '../theme/colors';
+import {MilkDeliveryStatus, getMilkDeliveryColors, getMilkDeliveryLabel} from '../utils/milkStatus';
 
 type Props = {
   day: number;
@@ -8,9 +9,7 @@ type Props = {
   disabled?: boolean;
   isToday?: boolean;
   isSelected?: boolean;
-  isSkipped?: boolean;
-  isModified?: boolean;
-  isDelivery?: boolean;
+  status?: MilkDeliveryStatus;
   onPress: () => void;
 };
 
@@ -20,36 +19,26 @@ export default function CalendarDay({
   disabled = false,
   isToday = false,
   isSelected = false,
-  isSkipped = false,
-  isModified = false,
-  isDelivery = false,
+  status = 'none',
   onPress,
 }: Props) {
-  const statusColor = isSkipped
-    ? colors.error
-    : isModified
-      ? colors.warning
-      : isDelivery
-        ? colors.success
-        : colors.textSecondary;
+  const statusColors = getMilkDeliveryColors(status);
 
   return (
     <TouchableOpacity
       accessibilityRole="button"
-      accessibilityLabel={`${day}${quantity ? `, ${quantity}` : ''}${isSkipped ? ', no milk' : ''}${isModified ? ', modified' : ''}`}
+      accessibilityLabel={`${day}${quantity ? `, ${quantity}` : ''}, ${getMilkDeliveryLabel(status)}`}
       disabled={disabled}
       onPress={onPress}
       style={[
         styles.day,
+        {backgroundColor: statusColors.backgroundColor},
         isSelected && styles.selected,
         isToday && styles.today,
         disabled && styles.disabled,
       ]}>
-      <Text style={[styles.dayNumber, {color: statusColor}]}>{day}</Text>
-      {quantity ? <Text numberOfLines={1} style={styles.quantity}>{quantity}</Text> : null}
-      {isDelivery || isSkipped || isModified ? (
-        <View style={[styles.indicator, {backgroundColor: statusColor}]}/>
-      ) : null}
+      <Text style={[styles.dayNumber, {color: statusColors.textColor}]}>{day}</Text>
+      {quantity ? <Text numberOfLines={1} style={[styles.quantity, {color: statusColors.textColor}]}>{quantity}</Text> : null}
     </TouchableOpacity>
   );
 }
@@ -63,13 +52,14 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     borderWidth: 1,
     borderColor: colors.border,
-    backgroundColor: colors.white,
+    backgroundColor: colors.milkNeutralBackground,
   },
   selected: {
-    backgroundColor: colors.surface,
+    borderColor: colors.primary,
+    borderWidth: 2,
   },
   today: {
-    borderColor: colors.primary,
+    borderColor: colors.primaryDark,
     borderWidth: 2,
   },
   disabled: {
@@ -80,13 +70,6 @@ const styles = StyleSheet.create({
   },
   quantity: {
     fontSize: 10,
-    color: colors.textSecondary,
-    marginTop: 2,
-  },
-  indicator: {
-    width: 5,
-    height: 5,
-    borderRadius: 3,
     marginTop: 2,
   },
 });

@@ -65,7 +65,7 @@ export default function SettingsScreen() {
       if (active) setSessionError(loadError instanceof Error ? loadError.message : 'Unable to load account information.');
     });
     return () => { active = false; };
-  }, [user?.id, user?.timezone, profile?.id]);
+  }, [profile, user]);
 
   const startDateRange = getStartDateRange(new Date(), user?.timezone ?? 'Asia/Kolkata');
 

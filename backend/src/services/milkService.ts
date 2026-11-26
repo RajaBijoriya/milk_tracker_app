@@ -1,5 +1,8 @@
+import {createHash} from 'node:crypto';
 import mongoose, {Types} from 'mongoose';
-import {LegacyImport, MilkEntry, MilkProfile, MonthlyBill, PriceHistory, QuantityHistory, User} from '../models/index.js';
+import {LegacyImport, MilkEntry, MilkPayment, MilkProfile, MonthlyBill, PriceHistory, QuantityHistory, User} from '../models/index.js';
+import type {ClientSession} from 'mongoose';
+import type {MilkPaymentRecord, PaymentMethod} from '../models/MilkPayment.js';
 import {
   canEditMilkDate,
   dateKeyAt,
@@ -9,6 +12,7 @@ import {
   monthKeyAt,
 } from '../utils/date.js';
 import {HttpError} from '../utils/errors.js';
+import {allocateOldestFirst, monthsBetween, paymentStatus} from './billingCalculations.js';
 import {calculateDailyAmount} from './statementCalculation.js';
 
 type ProfileInput = {
@@ -48,17 +52,47 @@ type StatementResult = {
   records: DailyRecord[];
 };
 
-async function findUser(userId: string) {
-  const user = await User.findById(userId);
+type PaymentInput = {
+  amountPaise: number;
+  paymentDate: string;
+  paymentMethod: PaymentMethod;
+  note: string;
+  idempotencyKey: string;
+  month?: string;
+};
+
+type BillingMonth = {
+  month: string;
+  totalQuantityMl: number;
+  totalAmountPaise: number;
+  amountPaidPaise: number;
+  remainingAmountPaise: number;
+  paymentStatus: 'paid' | 'unpaid' | 'partially_paid';
+  billStatus: 'provisional' | 'finalized';
+  readOnly: boolean;
+};
+
+type BillingDataset = {
+  profile: Awaited<ReturnType<typeof findOwnedProfile>>;
+  user: Awaited<ReturnType<typeof findUser>>;
+  bills: BillingMonth[];
+};
+
+async function findUser(userId: string, session?: ClientSession) {
+  let query = User.findById(userId);
+  if (session) query = query.session(session);
+  const user = await query;
   if (!user) throw new HttpError(401, 'SESSION_INVALID', 'Sign in again to continue.');
   return user;
 }
 
-async function findOwnedProfile(userId: string, profileId?: string) {
+async function findOwnedProfile(userId: string, profileId?: string, session?: ClientSession) {
   const query = profileId
     ? {_id: profileId, userId}
     : {userId, isActive: true};
-  const profile = await MilkProfile.findOne(query);
+  let profileQuery = MilkProfile.findOne(query);
+  if (session) profileQuery = profileQuery.session(session);
+  const profile = await profileQuery;
   if (!profile) throw new HttpError(404, 'PROFILE_NOT_FOUND', 'No milk profile was found for this account.');
   return profile;
 }
@@ -206,6 +240,9 @@ export async function updateProfile(
   const priceDate = patch.priceEffectiveDate ?? effectiveToday ?? '';
   if (quantityChanged) await assertEditableDate(userId, profile.id, quantityDate);
   if (priceChanged) await assertEditableDate(userId, profile.id, priceDate);
+  if (quantityChanged || priceChanged) {
+    await assertProfileChangePreservesPayments(userId, profile, patch, quantityDate, priceDate);
+  }
 
   const transaction = await mongoose.startSession();
   try {
@@ -289,8 +326,18 @@ export async function upsertEntry(
   const profile = await findOwnedProfile(userId);
   await assertEditableDate(userId, profile.id, date);
   const existing = await MilkEntry.findOne({userId, milkProfileId: profile.id, entryDate: date});
+  if ((!existing && input.version !== 0) || (existing && existing.version !== input.version)) {
+    throw new HttpError(409, 'VERSION_CONFLICT', 'This entry changed on another device. Refresh and try again.');
+  }
+  const month = date.slice(0, 7);
+  const statement = await getStatement(userId, month);
+  const currentRecord = statement.records.find(record => record.date === date);
+  if (currentRecord) {
+    const updatedTotal = statement.totalAmountPaise - currentRecord.amountPaise +
+      calculateDailyAmount(input.quantityMl, currentRecord.pricePerLitrePaise);
+    await assertBillAmountCoversPayments(userId, profile.id, month, updatedTotal);
+  }
   if (!existing) {
-    if (input.version !== 0) throw new HttpError(409, 'VERSION_CONFLICT', 'This entry changed on another device. Refresh and try again.');
     try {
       return await MilkEntry.create({
         userId,
@@ -308,9 +355,6 @@ export async function upsertEntry(
       throw error;
     }
   }
-  if (existing.version !== input.version) {
-    throw new HttpError(409, 'VERSION_CONFLICT', 'This entry changed on another device. Refresh and try again.');
-  }
   const updated = await MilkEntry.findOneAndUpdate(
     {_id: existing.id, userId, version: input.version},
     {$set: {quantityMl: input.quantityMl, note: input.note ?? ''}, $inc: {version: 1}},
@@ -323,6 +367,20 @@ export async function upsertEntry(
 export async function deleteEntry(userId: string, date: string, version: number) {
   const profile = await findOwnedProfile(userId);
   await assertEditableDate(userId, profile.id, date);
+  const existing = await MilkEntry.findOne({userId, milkProfileId: profile.id, entryDate: date});
+  if (existing && existing.version === version) {
+    const statement = await getStatement(userId, date.slice(0, 7));
+    const currentRecord = statement.records.find(record => record.date === date);
+    if (currentRecord) {
+      const defaultQuantity = await QuantityHistory.findOne({
+        userId, milkProfileId: profile.id, effectiveDate: {$lte: date},
+      }).sort({effectiveDate: -1}).lean();
+      const nextQuantity = defaultQuantity?.defaultQuantityMl ?? profile.defaultQuantityMl;
+      const updatedTotal = statement.totalAmountPaise - currentRecord.amountPaise +
+        calculateDailyAmount(nextQuantity, currentRecord.pricePerLitrePaise);
+      await assertBillAmountCoversPayments(userId, profile.id, date.slice(0, 7), updatedTotal);
+    }
+  }
   const deleted = await MilkEntry.findOneAndDelete({userId, milkProfileId: profile.id, entryDate: date, version});
   if (!deleted) {
     const exists = await MilkEntry.exists({userId, milkProfileId: profile.id, entryDate: date});
@@ -381,6 +439,60 @@ export async function getStatement(userId: string, month: string): Promise<State
   return statementDto(month, records, monthIsReadOnly(month, new Date(), user.timezone), 'provisional');
 }
 
+async function assertBillAmountCoversPayments(
+  userId: string,
+  profileId: Types.ObjectId | string,
+  month: string,
+  totalAmountPaise: number,
+) {
+  const payments = await MilkPayment.find({
+    userId,
+    milkProfileId: profileId,
+    'allocations.billMonth': month,
+  }).select('allocations').lean();
+  const amountPaid = sumPaymentAllocations(payments).get(month) ?? 0;
+  if (totalAmountPaise < amountPaid) {
+    throw new HttpError(
+      409,
+      'PAYMENT_ADJUSTMENT_CONFLICT',
+      `This change would make the ${month} bill smaller than its recorded payments.`,
+      {amountPaidPaise: amountPaid, recalculatedBillPaise: totalAmountPaise},
+    );
+  }
+}
+
+async function assertProfileChangePreservesPayments(
+  userId: string,
+  profile: Awaited<ReturnType<typeof findOwnedProfile>>,
+  patch: {
+    defaultQuantityMl?: number;
+    pricePerLitrePaise?: number;
+  },
+  quantityDate: string,
+  priceDate: string,
+) {
+  const user = await findUser(userId);
+  const currentMonth = monthKeyAt(new Date(), user.timezone);
+  const firstChangedDate = [
+    ...(patch.defaultQuantityMl !== undefined ? [quantityDate] : []),
+    ...(patch.pricePerLitrePaise !== undefined ? [priceDate] : []),
+  ].sort()[0];
+  for (const month of monthsBetween(firstChangedDate.slice(0, 7), currentMonth)) {
+    const statement = await getStatement(userId, month);
+    const recalculatedTotal = statement.records.reduce((total, record) => {
+      const quantity = patch.defaultQuantityMl !== undefined &&
+        record.date >= quantityDate && !record.isModified
+        ? patch.defaultQuantityMl
+        : record.quantityMl;
+      const price = patch.pricePerLitrePaise !== undefined && record.date >= priceDate
+        ? patch.pricePerLitrePaise
+        : record.pricePerLitrePaise;
+      return total + calculateDailyAmount(quantity, price);
+    }, 0);
+    await assertBillAmountCoversPayments(userId, profile.id, month, recalculatedTotal);
+  }
+}
+
 function statementDto(
   month: string,
   records: DailyRecord[],
@@ -396,6 +508,150 @@ function statementDto(
     status,
     readOnly: readOnly || status === 'finalized',
     records,
+  };
+}
+
+function sumPaymentAllocations(
+  payments: Array<Pick<MilkPaymentRecord, 'allocations'>>,
+): Map<string, number> {
+  const paidByMonth = new Map<string, number>();
+  for (const payment of payments) {
+    for (const allocation of payment.allocations) {
+      paidByMonth.set(
+        allocation.billMonth,
+        (paidByMonth.get(allocation.billMonth) ?? 0) + allocation.amountPaise,
+      );
+    }
+  }
+  return paidByMonth;
+}
+
+async function loadBillingDataset(
+  userId: string,
+  session?: ClientSession,
+): Promise<BillingDataset> {
+  let profile: Awaited<ReturnType<typeof findOwnedProfile>>;
+  let user: Awaited<ReturnType<typeof findUser>>;
+  if (session) {
+    profile = await findOwnedProfile(userId, undefined, session);
+    user = await findUser(userId, session);
+  } else {
+    [profile, user] = await Promise.all([findOwnedProfile(userId), findUser(userId)]);
+  }
+  const currentMonth = monthKeyAt(new Date(), user.timezone);
+  const firstMonth = profile.startDate.slice(0, 7);
+  const monthKeys = monthsBetween(firstMonth, currentMonth);
+  const dateRange = { $gte: profile.startDate, $lte: `${currentMonth}-31` };
+  const billRange = { $gte: firstMonth, $lte: currentMonth };
+
+  let storedBills: Array<{
+    billMonth: string;
+    totalQuantityMl: number;
+    totalAmountPaise: number;
+    status: string;
+  }> = [];
+  let entries: Array<{entryDate: string; quantityMl: number}> = [];
+  let priceHistory: Array<{effectiveDate: string; pricePerLitrePaise: number}> = [];
+  let quantityHistory: Array<{effectiveDate: string; defaultQuantityMl: number}> = [];
+  let payments: Array<Pick<MilkPaymentRecord, 'allocations'>> = [];
+  if (session) {
+    storedBills = await MonthlyBill.find({
+      userId, milkProfileId: profile.id, billMonth: billRange,
+    }).session(session).lean();
+    entries = await MilkEntry.find({
+      userId, milkProfileId: profile.id, entryDate: dateRange,
+    }).session(session).lean();
+    priceHistory = await PriceHistory.find({
+      userId, milkProfileId: profile.id, effectiveDate: {$lte: `${currentMonth}-31`},
+    }).sort({effectiveDate: 1}).session(session).lean();
+    quantityHistory = await QuantityHistory.find({
+      userId, milkProfileId: profile.id, effectiveDate: {$lte: `${currentMonth}-31`},
+    }).sort({effectiveDate: 1}).session(session).lean();
+    payments = await MilkPayment.find({
+      userId, milkProfileId: profile.id, 'allocations.billMonth': billRange,
+    }).session(session).lean();
+  } else {
+    [storedBills, entries, priceHistory, quantityHistory, payments] = await Promise.all([
+      MonthlyBill.find({userId, milkProfileId: profile.id, billMonth: billRange}).lean(),
+      MilkEntry.find({userId, milkProfileId: profile.id, entryDate: dateRange}).lean(),
+      PriceHistory.find({userId, milkProfileId: profile.id, effectiveDate: {$lte: `${currentMonth}-31`}})
+        .sort({effectiveDate: 1}).lean(),
+      QuantityHistory.find({userId, milkProfileId: profile.id, effectiveDate: {$lte: `${currentMonth}-31`}})
+        .sort({effectiveDate: 1}).lean(),
+      MilkPayment.find({userId, milkProfileId: profile.id, 'allocations.billMonth': billRange}).lean(),
+    ]);
+  }
+
+  const storedByMonth = new Map(storedBills.map(bill => [bill.billMonth, bill]));
+  const entryByDate = new Map(entries.map(entry => [entry.entryDate, entry]));
+  const paidByMonth = sumPaymentAllocations(payments);
+  const today = dateKeyAt(new Date(), user.timezone);
+  const bills: BillingMonth[] = monthKeys.map(month => {
+    const stored = storedByMonth.get(month);
+    let totalQuantityMl: number;
+    let totalAmountPaise: number;
+    if (stored?.status === 'finalized') {
+      totalQuantityMl = stored.totalQuantityMl;
+      totalAmountPaise = stored.totalAmountPaise;
+    } else {
+      const year = Number(month.slice(0, 4));
+      const monthNumber = Number(month.slice(5, 7));
+      const lastDay = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
+      const finalDay = month === currentMonth ? Number(today.slice(-2)) : lastDay;
+      totalQuantityMl = 0;
+      totalAmountPaise = 0;
+      for (let day = 1; day <= finalDay; day += 1) {
+        const date = `${month}-${String(day).padStart(2, '0')}`;
+        if (date < profile.startDate) continue;
+        const entry = entryByDate.get(date);
+        const quantity = quantityHistory
+          .filter(item => item.effectiveDate <= date).at(-1)?.defaultQuantityMl ?? profile.defaultQuantityMl;
+        const price = priceHistory
+          .filter(item => item.effectiveDate <= date).at(-1)?.pricePerLitrePaise ?? profile.pricePerLitrePaise;
+        const quantityMl = entry?.quantityMl ?? quantity;
+        totalQuantityMl += quantityMl;
+        totalAmountPaise += calculateDailyAmount(quantityMl, price);
+      }
+    }
+    const amountPaidPaise = paidByMonth.get(month) ?? 0;
+    const remainingAmountPaise = Math.max(0, totalAmountPaise - amountPaidPaise);
+    const status = paymentStatus(totalAmountPaise, amountPaidPaise);
+    return {
+      month,
+      totalQuantityMl,
+      totalAmountPaise,
+      amountPaidPaise,
+      remainingAmountPaise,
+      paymentStatus: status,
+      billStatus: stored?.status === 'finalized' ? 'finalized' : 'provisional',
+      readOnly: stored?.status === 'finalized' || monthIsReadOnly(month, new Date(), user.timezone),
+    };
+  });
+  return {profile, user, bills};
+}
+
+function summarizeBilling(dataset: BillingDataset, month: string) {
+  const selectedBill = dataset.bills.find(bill => bill.month === month);
+  if (!selectedBill) throw new HttpError(404, 'BILL_NOT_FOUND', 'No bill is available for that month.');
+  const previousOutstandingPaise = dataset.bills
+    .filter(bill => bill.month < month)
+    .reduce((sum, bill) => sum + bill.remainingAmountPaise, 0);
+  const totalBilledPaise = dataset.bills.reduce((sum, bill) => sum + bill.totalAmountPaise, 0);
+  const totalPaidPaise = dataset.bills.reduce((sum, bill) => sum + bill.amountPaidPaise, 0);
+  const totalOutstandingPaise = dataset.bills.reduce((sum, bill) => sum + bill.remainingAmountPaise, 0);
+  return {
+    month,
+    currentMonthBillPaise: selectedBill.totalAmountPaise,
+    currentMonthPaidPaise: selectedBill.amountPaidPaise,
+    currentMonthRemainingPaise: selectedBill.remainingAmountPaise,
+    previousOutstandingPaise,
+    totalPayablePaise: previousOutstandingPaise + selectedBill.remainingAmountPaise,
+    totalBilledPaise,
+    totalPaidPaise,
+    totalOutstandingPaise,
+    paidMonths: dataset.bills.filter(bill => bill.paymentStatus === 'paid').length,
+    unpaidMonths: dataset.bills.filter(bill => bill.paymentStatus === 'unpaid').length,
+    partiallyPaidMonths: dataset.bills.filter(bill => bill.paymentStatus === 'partially_paid').length,
   };
 }
 
@@ -461,14 +717,186 @@ export async function finalizeBill(userId: string, month: string) {
   return bill;
 }
 
+function assertMonthAvailable(month: string, profileStartDate: string, currentMonth: string) {
+  if (!isValidMonthKey(month)) throw new HttpError(400, 'INVALID_MONTH', 'Use a valid YYYY-MM month.');
+  if (month > currentMonth) throw new HttpError(400, 'FUTURE_MONTH', 'Bills are not available for a future month.');
+  if (month < profileStartDate.slice(0, 7)) {
+    throw new HttpError(404, 'BILL_NOT_FOUND', 'No bill is available before the profile start date.');
+  }
+}
+
+export async function getBillingSummary(userId: string, requestedMonth?: string) {
+  const dataset = await loadBillingDataset(userId);
+  const currentMonth = monthKeyAt(new Date(), dataset.user.timezone);
+  const month = requestedMonth ?? currentMonth;
+  assertMonthAvailable(month, dataset.profile.startDate, currentMonth);
+  const summary = summarizeBilling(dataset, month);
+  return {
+    ...summary,
+    currentMonth,
+    billingStartMonth: dataset.profile.startDate.slice(0, 7),
+  };
+}
+
+export async function getBillDetails(userId: string, month: string) {
+  const dataset = await loadBillingDataset(userId);
+  const currentMonth = monthKeyAt(new Date(), dataset.user.timezone);
+  assertMonthAvailable(month, dataset.profile.startDate, currentMonth);
+  const bill = dataset.bills.find(item => item.month === month);
+  if (!bill) throw new HttpError(404, 'BILL_NOT_FOUND', 'No bill is available for that month.');
+  const statement = await getStatement(userId, month);
+  const payments = await MilkPayment.find({
+    userId,
+    milkProfileId: dataset.profile.id,
+    'allocations.billMonth': month,
+  }).sort({paymentDate: 1, createdAt: 1}).lean();
+  const previousOutstandingPaise = dataset.bills
+    .filter(item => item.month < month)
+    .reduce((sum, item) => sum + item.remainingAmountPaise, 0);
+  const billingSummary = summarizeBilling(dataset, month);
+  return {
+    ...statement,
+    ...bill,
+    billingSummary: {
+      ...billingSummary,
+      currentMonth: currentMonth,
+      billingStartMonth: dataset.profile.startDate.slice(0, 7),
+    },
+    bills: dataset.bills,
+    previousOutstandingPaise,
+    totalPayablePaise: previousOutstandingPaise + bill.remainingAmountPaise,
+    paymentHistory: payments.map(payment => {
+      const allocation = payment.allocations.find(item => item.billMonth === month);
+      return {
+        id: payment._id.toString(),
+        amountPaise: allocation?.amountPaise ?? 0,
+        paymentAmountPaise: payment.amountPaise,
+        paymentDate: payment.paymentDate,
+        paymentMethod: payment.paymentMethod,
+        note: payment.note,
+        idempotencyKey: payment.idempotencyKey,
+      };
+    }).filter(payment => payment.amountPaise > 0),
+  };
+}
+
 export async function listBills(userId: string, page: number, limit: number) {
+  const dataset = await loadBillingDataset(userId);
+  const bills = dataset.bills.slice().reverse().slice((page - 1) * limit, page * limit);
+  return {page, limit, total: dataset.bills.length, bills};
+}
+
+export async function listPayments(
+  userId: string,
+  query: {page: number; limit: number; month?: string},
+) {
   const profile = await findOwnedProfile(userId);
-  const [bills, total] = await Promise.all([
-    MonthlyBill.find({userId, milkProfileId: profile.id})
-      .sort({billMonth: -1}).skip((page - 1) * limit).limit(limit).lean(),
-    MonthlyBill.countDocuments({userId, milkProfileId: profile.id}),
+  const filter: Record<string, unknown> = {userId, milkProfileId: profile.id};
+  if (query.month) {
+    assertMonthAvailable(query.month, profile.startDate, monthKeyAt(new Date(), (await findUser(userId)).timezone));
+    filter['allocations.billMonth'] = query.month;
+  }
+  const [payments, total] = await Promise.all([
+    MilkPayment.find(filter).sort({paymentDate: -1, createdAt: -1})
+      .skip((query.page - 1) * query.limit).limit(query.limit).lean(),
+    MilkPayment.countDocuments(filter),
   ]);
-  return {page, limit, total, bills};
+  return {page: query.page, limit: query.limit, total, payments};
+}
+
+function paymentFingerprint(input: PaymentInput): string {
+  return createHash('sha256').update(JSON.stringify({
+    amountPaise: input.amountPaise,
+    paymentDate: input.paymentDate,
+    paymentMethod: input.paymentMethod,
+    note: input.note,
+    month: input.month ?? null,
+  })).digest('hex');
+}
+
+function replayedPayment(payment: MilkPaymentRecord, fingerprint: string) {
+  if (payment.requestFingerprint !== fingerprint) {
+    throw new HttpError(409, 'IDEMPOTENCY_KEY_REUSED', 'This payment request key has already been used with different details.');
+  }
+  return {payment, replayed: true};
+}
+
+export async function recordPayment(userId: string, input: PaymentInput) {
+  const user = await findUser(userId);
+  const currentDate = dateKeyAt(new Date(), user.timezone);
+  const currentMonth = monthKeyAt(new Date(), user.timezone);
+  if (input.paymentDate > currentDate) {
+    throw new HttpError(422, 'PAYMENT_DATE_IN_FUTURE', 'A payment date cannot be in the future.');
+  }
+  const fingerprint = paymentFingerprint(input);
+  const session = await mongoose.startSession();
+  let outcome: {payment: MilkPaymentRecord; replayed: boolean} | null = null;
+  try {
+    await session.withTransaction(async () => {
+      const existing = await MilkPayment.findOne({userId, idempotencyKey: input.idempotencyKey})
+        .session(session).lean();
+      if (existing) {
+        outcome = replayedPayment(existing, fingerprint);
+        return;
+      }
+
+      const profile = await findOwnedProfile(userId, undefined, session);
+      await MilkProfile.updateOne(
+        {_id: profile._id, userId},
+        {$inc: {paymentRevision: 1}},
+        {session, timestamps: false},
+      );
+      const dataset = await loadBillingDataset(userId, session);
+      const requestedMonth = input.month;
+      if (requestedMonth) assertMonthAvailable(requestedMonth, dataset.profile.startDate, currentMonth);
+      const outstandingBills = dataset.bills.filter(bill =>
+        bill.remainingAmountPaise > 0 && (!requestedMonth || bill.month === requestedMonth),
+      );
+      const available = outstandingBills.reduce((sum, bill) => sum + bill.remainingAmountPaise, 0);
+      if (input.amountPaise > available) {
+        throw new HttpError(
+          422,
+          'PAYMENT_EXCEEDS_OUTSTANDING',
+          requestedMonth
+            ? 'The payment cannot exceed the remaining amount for this month.'
+            : 'The payment cannot exceed the total outstanding balance.',
+          {availablePaise: available},
+        );
+      }
+      if (available === 0) {
+        throw new HttpError(409, 'NO_OUTSTANDING_BALANCE', 'There is no outstanding bill to pay.');
+      }
+
+      const {allocations, remaining: unallocatedAmount} = allocateOldestFirst(outstandingBills, input.amountPaise);
+      if (unallocatedAmount !== 0) {
+        throw new HttpError(409, 'PAYMENT_ALLOCATION_CONFLICT', 'The outstanding balances changed. Refresh the bills and try again.');
+      }
+      const [created] = await MilkPayment.create([{
+        userId,
+        milkProfileId: dataset.profile.id,
+        idempotencyKey: input.idempotencyKey,
+        requestFingerprint: fingerprint,
+        amountPaise: input.amountPaise,
+        paymentDate: input.paymentDate,
+        paymentMethod: input.paymentMethod,
+        note: input.note,
+        allocations,
+      }], {session});
+      outcome = {payment: created.toObject(), replayed: false};
+    });
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 11000) {
+      const existing = await MilkPayment.findOne({userId, idempotencyKey: input.idempotencyKey}).lean();
+      if (existing) outcome = replayedPayment(existing, fingerprint);
+      else throw error;
+    } else {
+      throw error;
+    }
+  } finally {
+    await session.endSession();
+  }
+  if (!outcome) throw new HttpError(500, 'PAYMENT_RECORD_FAILED', 'Unable to record the payment.');
+  return outcome;
 }
 
 async function getImportContext(userId: string, input: ImportInput) {

@@ -2,7 +2,7 @@ import {Router} from 'express';
 import {authenticate} from '../middleware/authenticate.js';
 import {validate} from '../middleware/validate.js';
 import * as controller from '../controllers/milkController.js';
-import {paramSchemas, profileCreateSchema, profilePatchSchema} from '../validators/schemas.js';
+import {paramSchemas, paymentSchema, profileCreateSchema, profilePatchSchema} from '../validators/schemas.js';
 
 const milkRouter = Router();
 milkRouter.use(authenticate);
@@ -23,8 +23,11 @@ milkRouter.get('/statements/history', controller.getStatementHistory);
 milkRouter.get('/statements', controller.getStatementQuery);
 milkRouter.get('/statements/:month', validate('params', paramSchemas.month), controller.getStatement);
 
+milkRouter.get('/bills/summary', controller.getBillingSummary);
 milkRouter.get('/bills', controller.listBills);
 milkRouter.get('/bills/:month', validate('params', paramSchemas.month), controller.getBill);
 milkRouter.post('/bills/:month/finalize', validate('params', paramSchemas.month), controller.finalizeBill);
+milkRouter.get('/payments', controller.listPayments);
+milkRouter.post('/payments', validate('body', paymentSchema), controller.recordPayment);
 
 export default milkRouter;

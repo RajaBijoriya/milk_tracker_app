@@ -3,11 +3,12 @@ import {ScrollView, StyleSheet, View} from 'react-native';
 import {IconButton, Text} from 'react-native-paper';
 import {useNavigation} from '@react-navigation/native';
 import {useMilkStore} from '../store/milkStore';
-import {generateDailyRecords, formatLitres} from '../services/milkCalculation';
-import {monthKey, monthName, shiftMonth, todayKey} from '../utils/dateUtils';
+import {generateDailyRecords, formatLitres, getEffectiveQuantity} from '../services/milkCalculation';
+import {monthName, shiftMonth, todayKey} from '../utils/dateUtils';
 import CalendarDay from '../components/CalendarDay';
 import {colors} from '../theme/colors';
 import {canEditDateInWindow} from '../utils/editWindow';
+import {getMilkDeliveryStatus} from '../utils/milkStatus';
 
 export default function CalendarScreen() {
   const navigation = useNavigation<any>();
@@ -42,6 +43,9 @@ export default function CalendarScreen() {
           if (!day) return <View key={`empty-${index}`} style={styles.emptyDay}/>;
           const date = `${month}-${String(day).padStart(2, '0')}`;
           const record = recordMap.get(date);
+          const defaultQuantity = profile
+            ? getEffectiveQuantity(date, profile, quantityHistory)
+            : null;
           const beforeStart = Boolean(profile && date < profile.startDate);
           const readOnly = beforeStart || !canEditDateInWindow(date, new Date(), ownerTimezone) ||
             (statement?.month === date.slice(0, 7) && statement.readOnly);
@@ -54,9 +58,7 @@ export default function CalendarScreen() {
               disabled={disabled}
               isToday={date === todayKey()}
               isSelected={date === selectedDate}
-              isSkipped={record?.isSkipped}
-              isModified={record?.isModified}
-              isDelivery={Boolean(record && !record.isSkipped && !record.isModified)}
+              status={getMilkDeliveryStatus(record?.quantityMl, defaultQuantity, Boolean(record))}
               onPress={() => {
                 setSelectedDate(date);
                 navigation.navigate('Entry', {date, readOnly});

@@ -6,4 +6,5 @@ export {MilkEntry} from './MilkEntry.js';
 export {PriceHistory} from './PriceHistory.js';
 export {QuantityHistory} from './QuantityHistory.js';
 export {MonthlyBill} from './MonthlyBill.js';
+export {MilkPayment} from './MilkPayment.js';
 export {LegacyImport} from './LegacyImport.js';

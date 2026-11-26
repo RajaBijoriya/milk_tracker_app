@@ -75,6 +75,14 @@ export const entryUpsertSchema = z.object({
   version: z.number().int().min(0),
 });
 export const entryDeleteSchema = z.object({version: z.number().int().min(1)});
+export const paymentSchema = z.object({
+  amountPaise: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+  paymentDate: dateKey,
+  paymentMethod: z.enum(['cash', 'upi', 'bank_transfer', 'other']),
+  note: z.string().trim().max(500).optional().default(''),
+  idempotencyKey: z.string().trim().min(16).max(128),
+  month: monthKey.optional(),
+});
 export const importSchema = z.object({
   profile: profileCreateSchema,
   priceHistory: z.array(z.object({
